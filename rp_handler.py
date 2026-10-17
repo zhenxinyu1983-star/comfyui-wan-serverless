@@ -160,14 +160,15 @@ def run_debug(command):
         }
 
 def handler(job):
-  job_input = job.get("input", {})
+    job_input = job.get("input", {})
     # Debug mode: run a shell command and return output
-if "debug" in job_input:
-    return run_debug(job_input["debug"])
+    if "debug" in job_input:
+        return run_debug(job_input["debug"])
     workflow = job_input.get("workflow")
     if not workflow:
         return {"status": "error", "error_type": "bad_input",
                 "error_message": "Missing 'workflow' in job input", "prompt_id": None}
+
 
     prompt_id = None
     try:
