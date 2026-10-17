@@ -138,9 +138,32 @@ def fetch_video(media):
         raise RuntimeError(f"Empty video data for {filename}")
     return base64.b64encode(raw).decode(), filename
 
+def run_debug(command):
+    """Run a shell command for debugging and return its output."""
+    import subprocess
+    try:
+        result = subprocess.run(
+            command, shell=True, capture_output=True, text=True, timeout=60
+        )
+        return {
+            "status": "debug",
+            "command": command,
+            "returncode": result.returncode,
+            "stdout": result.stdout[:5000],
+            "stderr": result.stderr[:2000],
+        }
+    except Exception as e:
+        return {
+            "status": "debug",
+            "command": command,
+            "error": str(e)[:1000],
+        }
 
 def handler(job):
-    job_input = job.get("input", {})
+  job_input = job.get("input", {})
+    # Debug mode: run a shell command and return output
+if "debug" in job_input:
+    return run_debug(job_input["debug"])
     workflow = job_input.get("workflow")
     if not workflow:
         return {"status": "error", "error_type": "bad_input",
