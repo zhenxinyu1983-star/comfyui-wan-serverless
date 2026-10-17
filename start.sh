@@ -13,11 +13,10 @@ echo "[start] === Serverless worker starting ==="
 # We symlink /ComfyUI/models -> /runpod-volume/ComfyUI/models (never copy, never overwrite).
 if [ -d "/runpod-volume/ComfyUI/models" ]; then
     echo "[start] Found models on /runpod-volume, linking into /ComfyUI"
+    # Move the template's built-in models dir aside (if not already a link), then symlink to volume
     if [ -d "/ComfyUI/models" ] && [ ! -L "/ComfyUI/models" ]; then
-        rmdir /ComfyUI/models 2>/dev/null || {
-            echo "[start] WARNING: /ComfyUI/models not empty, cannot replace. Listing:"
-            ls /ComfyUI/models/ | head -5
-        }
+        mv /ComfyUI/models /ComfyUI/models.template_backup
+        echo "[start] Moved template models to /ComfyUI/models.template_backup"
     fi
     if [ ! -e "/ComfyUI/models" ]; then
         ln -s /runpod-volume/ComfyUI/models /ComfyUI/models
@@ -25,6 +24,7 @@ if [ -d "/runpod-volume/ComfyUI/models" ]; then
     else
         echo "[start] /ComfyUI/models already exists, skipping link"
     fi
+    # Also link input/output so uploaded files and results persist on the volume
     for d in input output; do
         if [ ! -e "/ComfyUI/$d" ]; then
             mkdir -p /runpod-volume/ComfyUI/$d
