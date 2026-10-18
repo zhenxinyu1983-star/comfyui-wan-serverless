@@ -6,6 +6,13 @@ FROM hearmeman/comfyui-wan-template:v29
 # RunPod serverless SDK
 RUN pip install --no-cache-dir runpod
 
+# --- ReActor face-swap node (2026-10-18) ---
+# Custom node package must be baked into the image (custom_nodes is not on the volume).
+# Models (inswapper_128.onnx) are on the network volume at /runpod-volume/ComfyUI/models/insightface/.
+RUN git clone https://github.com/Gourieff/ComfyUI-ReActor /ComfyUI/custom_nodes/ComfyUI-ReActor \
+    && pip install --no-cache-dir -r /ComfyUI/custom_nodes/ComfyUI-ReActor/requirements.txt \
+    && pip install --no-cache-dir onnxruntime-gpu
+
 # Handler + startup script
 COPY rp_handler.py /rp_handler.py
 COPY start.sh /start.sh
