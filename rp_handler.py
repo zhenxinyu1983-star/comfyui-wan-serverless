@@ -77,17 +77,42 @@ def wait_for_comfyui(timeout=600):
 
 
 def stage_input_files(images):
-    """Write base64 input files into ComfyUI's input directory."""
+    """Write input files into ComfyUI's input directory.
+
+    Items are {filename, data} (base64) or {filename, url} (presigned URL,
+    used for files too large for the /run payload — downloads directly).
+    """
     os.makedirs(COMFYUI_INPUT_DIR, exist_ok=True)
     staged = []
     for item in images or []:
         filename = os.path.basename(item["filename"])  # prevent path traversal
-        data = base64.b64decode(item["data"])
         dest = os.path.join(COMFYUI_INPUT_DIR, filename)
-        with open(dest, "wb") as f:
-            f.write(data)
+        if item.get("url"):
+            _download_to_file(item["url"], dest)
+        else:
+            data = base64.b64decode(item["data"])
+            with open(dest, "wb") as f:
+                f.write(data)
         staged.append(filename)
     return staged
+
+
+def _download_to_file(url, dest, timeout=600):
+    """Stream-download url to dest (chunked, no full-file memory load)."""
+    req = urllib.request.Request(url, headers={"User-Agent": "rp-handler/1.0"})
+    tmp = dest + ".part"
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r, open(tmp, "wb") as f:
+            while True:
+                chunk = r.read(1024 * 1024)
+                if not chunk:
+                    break
+                f.write(chunk)
+        os.replace(tmp, dest)
+    except Exception:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        raise
 
 
 def submit_workflow(workflow):
@@ -138,6 +163,7 @@ def fetch_video(media):
         raise RuntimeError(f"Empty video data for {filename}")
     return base64.b64encode(raw).decode(), filename
 
+
 def run_debug(command):
     """Run a shell command for debugging and return its output."""
     import subprocess
@@ -159,16 +185,18 @@ def run_debug(command):
             "error": str(e)[:1000],
         }
 
+
 def handler(job):
     job_input = job.get("input", {})
+
     # Debug mode: run a shell command and return output
     if "debug" in job_input:
         return run_debug(job_input["debug"])
+
     workflow = job_input.get("workflow")
     if not workflow:
         return {"status": "error", "error_type": "bad_input",
                 "error_message": "Missing 'workflow' in job input", "prompt_id": None}
-
 
     prompt_id = None
     try:
