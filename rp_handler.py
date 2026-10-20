@@ -115,6 +115,50 @@ def _download_to_file(url, dest, timeout=600):
         raise
 
 
+def normalize_driving_video(workflow, filename, target_frames, fps=16):
+    """Rewrite a staged driving video to exactly target_frames @ fps (CFR).
+
+    Wan Animate's pose-conditioning latent length comes from however many
+    frames VHS manages to load from the user's clip -- NOT from the
+    workflow's num_frames. A real "exactly 10.0s" clip yields only 160
+    frames at 16fps (then 157 after the Wan 4k+1 rule -> 40 latents) while
+    the sampler builds 41 latents from num_frames=161, and predict_with_cfg
+    dies on the size mismatch. Normalizing the file so VHS is guaranteed to
+    deliver exactly target_frames makes both sides identical by
+    construction, for any source fps / duration / frame count:
+      - fps=<fps> resamples any source (incl. VFR phone clips) to CFR
+      - tpad clones the last frame to pad short sources
+      - -frames:v N hard-truncates long sources
+    The workflow's references to the original filename are rewritten to
+    the normalized file. Returns the new filename.
+    """
+    import subprocess
+
+    src = os.path.join(COMFYUI_INPUT_DIR, os.path.basename(filename))
+    if not os.path.exists(src):
+        raise RuntimeError(f"normalize target not staged: {filename}")
+    stem = os.path.splitext(os.path.basename(filename))[0]
+    new_name = f"{stem}_norm.mp4"
+    dest = os.path.join(COMFYUI_INPUT_DIR, new_name)
+    cmd = [
+        "ffmpeg", "-y", "-i", src,
+        "-vf", f"fps={fps},tpad=stop_mode=clone:stop_duration=40",
+        "-frames:v", str(int(target_frames)),
+        "-an", "-c:v", "libx264", "-pix_fmt", "yuv420p", dest,
+    ]
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+    if r.returncode != 0 or not os.path.exists(dest):
+        tail = (r.stderr or "")[-800:]
+        raise RuntimeError(f"ffmpeg normalize failed for {filename}: {tail}")
+    # Point every workflow input that referenced the old file at the new one
+    for node in (workflow or {}).values():
+        inputs = node.get("inputs") or {}
+        for key, val in inputs.items():
+            if val == filename:
+                inputs[key] = new_name
+    return new_name
+
+
 def submit_workflow(workflow):
     resp = _http("POST", "/prompt", {"prompt": workflow}, timeout=120)
     prompt_id = resp.get("prompt_id")
@@ -123,17 +167,62 @@ def submit_workflow(workflow):
     return prompt_id
 
 
+def _prompt_in_queue(prompt_id):
+    """True if ComfyUI's queue currently holds this prompt."""
+    try:
+        q = _http("GET", "/queue", timeout=15)
+    except Exception:
+        return False
+    for key in ("queue_running", "queue_pending"):
+        for item in q.get(key, []) or []:
+            if isinstance(item, (list, tuple)) and len(item) > 1 and item[1] == prompt_id:
+                return True
+    return False
+
+
 def wait_for_result(prompt_id):
-    """Poll /history until the prompt finishes or fails."""
+    """Poll /history until the prompt finishes or fails.
+
+    Liveness guards (a dead/restarted ComfyUI must not burn the full
+    MAX_WAIT_SECONDS of billed worker time):
+      - 6 consecutive /history failures -> probe /system_stats; if that
+        also fails, ComfyUI is gone: raise immediately.
+      - prompt absent from BOTH history and queue for >120s -> it was
+        lost in a ComfyUI restart: raise.
+    """
     deadline = time.time() + MAX_WAIT_SECONDS
+    consec_errors = 0
+    missing_since = None
     while time.time() < deadline:
-        # Check queue first for execution errors
         try:
             hist = _http("GET", f"/history/{prompt_id}", timeout=30)
+            consec_errors = 0
         except Exception as e:
+            consec_errors += 1
+            if consec_errors >= 6:
+                try:
+                    _http("GET", "/system_stats", timeout=15)
+                    consec_errors = 0  # ComfyUI alive; history endpoint flaky
+                except Exception:
+                    raise RuntimeError(
+                        f"ComfyUI unreachable after {consec_errors} poll failures: {e}"
+                    )
             time.sleep(POLL_INTERVAL)
             continue
         entry = hist.get(prompt_id)
+        if not entry:
+            if _prompt_in_queue(prompt_id):
+                missing_since = None
+            else:
+                if missing_since is None:
+                    missing_since = time.time()
+                elif time.time() - missing_since > 120:
+                    raise RuntimeError(
+                        "Prompt vanished from history and queue (ComfyUI restarted?)"
+                    )
+            time.sleep(POLL_INTERVAL)
+            continue
+        missing_since = None
         if entry:
             status = entry.get("status", {})
             if status.get("completed"):
@@ -186,6 +275,49 @@ def run_debug(command):
         }
 
 
+def _cleanup_job_files(staged_names, media):
+    """Delete this job's staged inputs and rendered output from local disk.
+
+    Serverless workers are reused across jobs and the endpoint disk is
+    small (10GB); without cleanup, inputs/outputs accumulate until the
+    disk fills and every job starts failing. Best-effort: never raises.
+    """
+    try:
+        for name in staged_names or []:
+            for cand in (name, os.path.splitext(name)[0] + "_norm.mp4"):
+                try:
+                    os.remove(os.path.join(COMFYUI_INPUT_DIR, cand))
+                except OSError:
+                    pass
+        if media:
+            out_path = os.path.join(
+                COMFYUI_OUTPUT_DIR, media.get("subfolder", ""), media.get("filename", "")
+            )
+            try:
+                os.remove(out_path)
+            except OSError:
+                pass
+    except Exception:
+        pass
+
+
+def _sweep_stale_files(max_age_sec=6 * 3600):
+    """Drop input/output files older than max_age_sec (leftovers of crashed jobs)."""
+    import time as _time
+
+    for d in (COMFYUI_INPUT_DIR, COMFYUI_OUTPUT_DIR):
+        try:
+            for name in os.listdir(d):
+                fp = os.path.join(d, name)
+                try:
+                    if os.path.isfile(fp) and _time.time() - os.path.getmtime(fp) > max_age_sec:
+                        os.remove(fp)
+                except OSError:
+                    pass
+        except OSError:
+            pass
+
+
 def handler(job):
     job_input = job.get("input", {})
 
@@ -199,9 +331,15 @@ def handler(job):
                 "error_message": "Missing 'workflow' in job input", "prompt_id": None}
 
     prompt_id = None
+    staged = []
+    media = None
     try:
+        _sweep_stale_files()
         wait_for_comfyui()
-        stage_input_files(job_input.get("images"))
+        staged = stage_input_files(job_input.get("images"))
+        nv = job_input.get("normalize_video")
+        if nv:
+            normalize_driving_video(workflow, nv["filename"], nv["frames"], nv.get("fps", 16))
         prompt_id = submit_workflow(workflow)
         media = wait_for_result(prompt_id)
         video_b64, filename = fetch_video(media)
@@ -210,6 +348,8 @@ def handler(job):
     except Exception as e:
         return {"status": "error", "error_type": type(e).__name__,
                 "error_message": str(e)[:2000], "prompt_id": prompt_id}
+    finally:
+        _cleanup_job_files(staged, media)
 
 
 import urllib.parse  # noqa: E402  (kept at bottom to avoid shadowing in _http)
