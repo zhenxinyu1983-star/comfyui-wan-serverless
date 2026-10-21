@@ -115,7 +115,7 @@ def _download_to_file(url, dest, timeout=600):
         raise
 
 
-def normalize_driving_video(workflow, filename, target_frames, fps=16):
+def normalize_driving_video(workflow, filename, target_frames, fps=16, box=None):
     """Rewrite a staged driving video to exactly target_frames @ fps (CFR).
 
     Wan Animate's pose-conditioning latent length comes from however many
@@ -156,7 +156,51 @@ def normalize_driving_video(workflow, filename, target_frames, fps=16):
         for key, val in inputs.items():
             if val == filename:
                 inputs[key] = new_name
+    if box:
+        _fit_canvas_to_source(workflow, src, box)
     return new_name
+
+
+def _fit_canvas_to_source(workflow, src_video, box):
+    """Fit the generation canvas to the driving video's aspect ratio.
+
+    The paid tier is a pixel budget (box = [w, h], area = w*h). A portrait
+    driving video must produce a portrait canvas of the SAME area --
+    forcing everything into the landscape box stretched portrait inputs
+    (user-verified 2026-10-20). Canvas dims are rounded to multiples of
+    16 (Wan latent grid). Rewrites the geometry consumers in the
+    workflow: WanVideoAnimateEmbeds width/height, the ImageScale
+    center-crop node, and DWPreprocessor resolution.
+    """
+    import math
+    import subprocess
+
+    r = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0",
+         "-show_entries", "stream=width,height", "-of", "csv=p=0", src_video],
+        capture_output=True, text=True, timeout=60)
+    try:
+        sw, sh = (int(x) for x in r.stdout.strip().split(",")[:2])
+    except Exception:
+        return  # probe failed: keep the tier canvas rather than fail the job
+    if sw <= 0 or sh <= 0:
+        return
+    bw, bh = int(box[0]), int(box[1])
+    area = bw * bh
+    ar = sw / sh
+    cw = max(160, int(round(math.sqrt(area * ar) / 16.0)) * 16)
+    ch = max(160, int(round(math.sqrt(area / ar) / 16.0)) * 16)
+    for node in (workflow or {}).values():
+        ct = node.get("class_type")
+        inputs = node.get("inputs") or {}
+        if ct == "WanVideoAnimateEmbeds":
+            inputs["width"] = cw
+            inputs["height"] = ch
+        elif ct == "ImageScale":
+            inputs["width"] = cw
+            inputs["height"] = ch
+        elif ct == "DWPreprocessor":
+            inputs["resolution"] = cw
 
 
 def submit_workflow(workflow):
@@ -253,6 +297,90 @@ def fetch_video(media):
     return base64.b64encode(raw).decode(), filename
 
 
+def _locate_output_file(media):
+    """Absolute path of a rendered output on this worker's disk."""
+    return os.path.join(
+        COMFYUI_OUTPUT_DIR, media.get("subfolder", ""), media.get("filename", "")
+    )
+
+
+def _extract_last_frame(video_path, dest_path):
+    """Extract the last frame of video_path into dest_path (format by extension)."""
+    import subprocess
+
+    cmd = [
+        "ffmpeg", "-y", "-sseof", "-0.1", "-i", video_path,
+        "-vframes", "1", dest_path,
+    ]
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    if r.returncode != 0 or not os.path.exists(dest_path):
+        tail = (r.stderr or "")[-500:]
+        raise RuntimeError(f"ffmpeg last-frame extract failed for {video_path}: {tail}")
+
+
+def _concat_videos(paths, dest_path):
+    """Lossless-join segment videos (same codec/params) via the concat demuxer."""
+    import subprocess
+
+    list_path = dest_path + ".concat.txt"
+    with open(list_path, "w") as f:
+        for pth in paths:
+            f.write("file '%s'\n" % pth.replace("'", "'\\''"))
+    try:
+        cmd = [
+            "ffmpeg", "-y", "-f", "concat", "-safe", "0",
+            "-i", list_path, "-c", "copy", dest_path,
+        ]
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        if r.returncode != 0 or not os.path.exists(dest_path):
+            tail = (r.stderr or "")[-500:]
+            raise RuntimeError(f"ffmpeg concat failed: {tail}")
+    finally:
+        try:
+            os.remove(list_path)
+        except OSError:
+            pass
+
+
+def run_segmented(job_input, workflow, seg_spec, cleanup_extra):
+    """Segmented long-video mode (e.g. 30s = 2 x 15s chained segments).
+
+    The caller (Cloudflare Worker) supplies the first segment's workflow
+    plus `next_workflow` for continuations and `restage_filename` -- the
+    input filename the continuation workflow reads its start image from.
+    Per segment: submit, wait, then overwrite the restage file with the
+    previous segment's last frame so the next segment continues from it
+    (the model stays loaded in ComfyUI between segments -- no reload).
+    Finally the segments are concatenated losslessly and returned under
+    the normal single-video contract. Any segment failing fails the job.
+    """
+    count = int(seg_spec.get("count") or 0)
+    next_workflow = seg_spec.get("next_workflow")
+    restage = seg_spec.get("restage_filename")
+    if count < 2 or not next_workflow or not restage:
+        raise RuntimeError(f"Bad segmented spec: count={count}, "
+                           f"next_workflow={'yes' if next_workflow else 'no'}, restage={restage}")
+    seg_paths = []
+    prompt_id = submit_workflow(workflow)
+    media = wait_for_result(prompt_id)
+    seg_paths.append(_locate_output_file(media))
+    restage_path = os.path.join(COMFYUI_INPUT_DIR, os.path.basename(restage))
+    for _ in range(count - 1):
+        _extract_last_frame(seg_paths[-1], restage_path)
+        prompt_id = submit_workflow(next_workflow)
+        media = wait_for_result(prompt_id)
+        seg_paths.append(_locate_output_file(media))
+    for pth in seg_paths:
+        cleanup_extra.append(pth)
+    final_name = "segmented_full.mp4"
+    final_path = os.path.join(COMFYUI_OUTPUT_DIR, final_name)
+    _concat_videos(seg_paths, final_path)
+    cleanup_extra.append(final_path)
+    with open(final_path, "rb") as f:
+        video_b64 = base64.b64encode(f.read()).decode()
+    return video_b64, final_name, prompt_id
+
+
 def run_debug(command):
     """Run a shell command for debugging and return its output."""
     import subprocess
@@ -275,7 +403,12 @@ def run_debug(command):
         }
 
 
-def _cleanup_job_files(staged_names, media):
+def _cleanup_job_files(staged_names, media, extra_paths=None):
+    for pth in extra_paths or []:
+        try:
+            os.remove(pth)
+        except OSError:
+            pass
     """Delete this job's staged inputs and rendered output from local disk.
 
     Serverless workers are reused across jobs and the endpoint disk is
@@ -333,13 +466,20 @@ def handler(job):
     prompt_id = None
     staged = []
     media = None
+    seg_extra = []
     try:
         _sweep_stale_files()
         wait_for_comfyui()
         staged = stage_input_files(job_input.get("images"))
         nv = job_input.get("normalize_video")
         if nv:
-            normalize_driving_video(workflow, nv["filename"], nv["frames"], nv.get("fps", 16))
+            normalize_driving_video(workflow, nv["filename"], nv["frames"], nv.get("fps", 16), nv.get("box"))
+        seg_spec = job_input.get("segmented")
+        if seg_spec:
+            video_b64, filename, prompt_id = run_segmented(
+                job_input, workflow, seg_spec, seg_extra)
+            return {"status": "success", "video": video_b64,
+                    "filename": filename, "prompt_id": prompt_id}
         prompt_id = submit_workflow(workflow)
         media = wait_for_result(prompt_id)
         video_b64, filename = fetch_video(media)
@@ -349,7 +489,7 @@ def handler(job):
         return {"status": "error", "error_type": type(e).__name__,
                 "error_message": str(e)[:2000], "prompt_id": prompt_id}
     finally:
-        _cleanup_job_files(staged, media)
+        _cleanup_job_files(staged, media, seg_extra)
 
 
 import urllib.parse  # noqa: E402  (kept at bottom to avoid shadowing in _http)
