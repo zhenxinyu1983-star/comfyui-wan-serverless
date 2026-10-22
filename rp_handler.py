@@ -319,27 +319,46 @@ def _extract_last_frame(video_path, dest_path):
 
 
 def _concat_videos(paths, dest_path):
-    """Lossless-join segment videos (same codec/params) via the concat demuxer."""
+    """Join segment videos into one file, dropping the first frame of every
+    continuation segment.
+
+    Each continuation was generated FROM the previous segment's last frame,
+    so its first frame re-renders that same instant; keeping it would give
+    count*241 frames instead of the site-wide duration*16+1 contract
+    (manager ruling 2026-10-20: chained 30s must be exactly 481). A stream
+    copy cannot cut frame-exactly, so the join is one filtergraph pass:
+    trim -> concat -> single re-encode (libx264 crf 18, near-transparent
+    against the segments' own encoding).
+    """
     import subprocess
 
-    list_path = dest_path + ".concat.txt"
-    with open(list_path, "w") as f:
-        for pth in paths:
-            f.write("file '%s'\n" % pth.replace("'", "'\\''"))
-    try:
-        cmd = [
-            "ffmpeg", "-y", "-f", "concat", "-safe", "0",
-            "-i", list_path, "-c", "copy", dest_path,
-        ]
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-        if r.returncode != 0 or not os.path.exists(dest_path):
-            tail = (r.stderr or "")[-500:]
-            raise RuntimeError(f"ffmpeg concat failed: {tail}")
-    finally:
-        try:
-            os.remove(list_path)
-        except OSError:
-            pass
+    if len(paths) == 1:
+        import shutil
+        shutil.copyfile(paths[0], dest_path)
+        return
+    cmd = ["ffmpeg", "-y"]
+    for pth in paths:
+        cmd += ["-i", pth]
+    chains = []
+    labels = []
+    for i in range(len(paths)):
+        lbl = f"s{i}"
+        if i == 0:
+            chains.append(f"[0:v]setpts=PTS-STARTPTS,format=yuv420p[{lbl}]")
+        else:
+            chains.append(
+                f"[{i}:v]trim=start_frame=1,setpts=PTS-STARTPTS,format=yuv420p[{lbl}]")
+        labels.append(f"[{lbl}]")
+    filt = ";".join(chains) + ";" + "".join(labels) + \
+        f"concat=n={len(paths)}:v=1:a=0[outv]"
+    cmd += [
+        "-filter_complex", filt, "-map", "[outv]",
+        "-c:v", "libx264", "-crf", "18", "-pix_fmt", "yuv420p", dest_path,
+    ]
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+    if r.returncode != 0 or not os.path.exists(dest_path):
+        tail = (r.stderr or "")[-500:]
+        raise RuntimeError(f"ffmpeg concat failed: {tail}")
 
 
 def run_segmented(job_input, workflow, seg_spec, cleanup_extra):
@@ -351,8 +370,9 @@ def run_segmented(job_input, workflow, seg_spec, cleanup_extra):
     Per segment: submit, wait, then overwrite the restage file with the
     previous segment's last frame so the next segment continues from it
     (the model stays loaded in ComfyUI between segments -- no reload).
-    Finally the segments are concatenated losslessly and returned under
-    the normal single-video contract. Any segment failing fails the job.
+    Finally the segments are joined (continuation first frames dropped,
+    see _concat_videos) and returned under the normal single-video
+    contract. Any segment failing fails the job.
     """
     count = int(seg_spec.get("count") or 0)
     next_workflow = seg_spec.get("next_workflow")
