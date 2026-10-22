@@ -10,16 +10,12 @@ RUN pip install --no-cache-dir runpod
 # 会导致 MultiTalkWav2VecEmbeds 报 'NoneType' object is not subscriptable (K22 双人失败)
 RUN pip install --no-cache-dir "transformers==4.44.2"
 
-# --- ReActor face-swap node (2026-10-18) ---
-# Custom node package must be baked into the image (custom_nodes is not on the volume).
-# Models (inswapper_128.onnx) are on the network volume at /runpod-volume/ComfyUI/models/insightface/.
-RUN git clone https://github.com/Gourieff/ComfyUI-ReActor /ComfyUI/custom_nodes/ComfyUI-ReActor \
-    && pip install --no-cache-dir -r /ComfyUI/custom_nodes/ComfyUI-ReActor/requirements.txt \
-    && pip install --no-cache-dir onnxruntime-gpu
-
 # Handler + startup script
 COPY rp_handler.py /rp_handler.py
 COPY start.sh /start.sh
+
+# Custom nodes: WanCameraOrbitEmbedding (Fun Camera Orbit, 2026-10-20)
+COPY custom_nodes/ComfyUI-TST-Orbit /ComfyUI/custom_nodes/ComfyUI-TST-Orbit
 RUN chmod +x /start.sh
 
 # ComfyUI API port (for reference; serverless uses the handler, not direct HTTP)
