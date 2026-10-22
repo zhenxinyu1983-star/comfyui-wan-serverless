@@ -1,6 +1,6 @@
 #!/bin/bash
 # Serverless worker startup:
-#  1. Adapt the network volume (/runpod-volume) to the paths ComfyUI expects
+#  1. Adapt the network volume (/runpod-volume) to the /workspace paths the template expects
 #  2. Start ComfyUI in the background
 #  3. Start the RunPod handler in the foreground
 set -e
@@ -32,6 +32,7 @@ if [ -d "/runpod-volume/ComfyUI/models" ]; then
             echo "[start] Linked /ComfyUI/$d -> /runpod-volume/ComfyUI/$d"
         fi
     done
+    # Sanity check: list model dirs (no downloads here — never overwrite existing models)
     echo "[start] Model dirs on volume:"
     ls /runpod-volume/ComfyUI/models/ 2>/dev/null || echo "[start] WARNING: models dir empty or unreadable"
 else
@@ -40,9 +41,30 @@ else
     echo "[start] ComfyUI will fail on missing models if the volume is not attached."
 fi
 
+# --- RIFE weights for ComfyUI-Frame-Interpolation (1080P project, prepared 2026-10-21) ---
+# The extension loads weights from its own ckpts/rife/ dir (its config.yaml: ckpts_path:./ckpts),
+# NOT from ComfyUI/models. The weight lives on the volume; link it in before ComfyUI starts.
+RIFE_SRC=""
+for cand in /runpod-volume/rife_ckpts/rife49.pth /runpod-volume/ComfyUI/models/rife_ckpts/rife49.pth; do
+    if [ -f "$cand" ]; then RIFE_SRC="$cand"; break; fi
+done
+RIFE_DIR=/ComfyUI/custom_nodes/ComfyUI-Frame-Interpolation/ckpts/rife
+if [ -n "$RIFE_SRC" ] && [ -d /ComfyUI/custom_nodes/ComfyUI-Frame-Interpolation ]; then
+    mkdir -p "$RIFE_DIR" || echo "[start] NOTE: could not create RIFE ckpts dir (continuing)"
+    if [ ! -e "$RIFE_DIR/rife49.pth" ]; then
+        ln -s "$RIFE_SRC" "$RIFE_DIR/rife49.pth" || echo "[start] NOTE: RIFE link failed (continuing)"
+        echo "[start] Linked RIFE weight $RIFE_SRC -> $RIFE_DIR/rife49.pth"
+    fi
+else
+    echo "[start] NOTE: RIFE weight not found on volume (1080P interpolation unavailable, rest unaffected)"
+fi
+
+# ComfyUI input/output dirs must exist and be writable
 mkdir -p /ComfyUI/input /ComfyUI/output 2>/dev/null || true
 
 # --- 2. Start ComfyUI in background ---
+# The template's default command starts ComfyUI; we replicate the essential part.
+# If the image has its own start script, prefer it.
 COMFYUI_CMD=""
 if [ -f "/ComfyUI/main.py" ]; then
     COMFYUI_CMD="python3 /ComfyUI/main.py --listen 0.0.0.0 --port 8188 --enable-cors-header '*'"
@@ -60,5 +82,6 @@ nohup $COMFYUI_CMD > /tmp/comfyui.log 2>&1 &
 echo "[start] ComfyUI starting in background (log: /tmp/comfyui.log)"
 
 # --- 3. Start the RunPod handler (foreground, keeps container alive) ---
+# The handler waits for ComfyUI itself (wait_for_comfyui) before taking jobs.
 echo "[start] Starting RunPod handler"
 exec python3 /rp_handler.py
