@@ -297,6 +297,38 @@ def fetch_video(media):
     return base64.b64encode(raw).decode(), filename
 
 
+def find_png_output(prompt_id, node_id):
+    """First image output of one node from a finished prompt's history.
+
+    TSTSaveLastFramePNG returns a ui dict with images, so /history carries
+    the PNG entry. Returns the media dict or None; a missing entry must
+    never fail a job whose video already succeeded.
+    """
+    try:
+        hist = _http("GET", f"/history/{prompt_id}", timeout=30)
+    except Exception:
+        return None
+    if not isinstance(hist, dict):
+        return None
+    entry = hist.get(prompt_id) or {}
+    outputs = entry.get("outputs", {}) if isinstance(entry, dict) else {}
+    node_out = outputs.get(node_id) or {}
+    images = node_out.get("images", []) if isinstance(node_out, dict) else []
+    return images[0] if images else None
+
+
+def fetch_image(media):
+    """Download one rendered image via /view and base64-encode it."""
+    filename = media["filename"]
+    subfolder = media.get("subfolder", "")
+    mtype = media.get("type", "output")
+    qs = f"filename={urllib.parse.quote(filename)}&subfolder={urllib.parse.quote(subfolder)}&type={urllib.parse.quote(mtype)}"
+    raw = _http("GET", f"/view?{qs}", timeout=120)
+    if not isinstance(raw, bytes) or len(raw) == 0:
+        raise RuntimeError(f"Empty image data for {filename}")
+    return base64.b64encode(raw).decode(), filename
+
+
 def _locate_output_file(media):
     """Absolute path of a rendered output on this worker's disk."""
     return os.path.join(
@@ -503,8 +535,26 @@ def handler(job):
         prompt_id = submit_workflow(workflow)
         media = wait_for_result(prompt_id)
         video_b64, filename = fetch_video(media)
-        return {"status": "success", "video": video_b64,
-                "filename": filename, "prompt_id": prompt_id}
+        # Last-frame PNG (Orbit save node): auxiliary output, never allowed
+        # to fail a job whose video already succeeded.
+        png_media = None
+        png_b64 = png_filename = None
+        png_node = job_input.get("png_node")
+        if png_node:
+            try:
+                png_media = find_png_output(prompt_id, png_node)
+                if png_media:
+                    png_b64, png_filename = fetch_image(png_media)
+            except Exception:
+                png_b64 = png_filename = None
+            if png_media:
+                seg_extra.append(_locate_output_file(png_media))
+        out = {"status": "success", "video": video_b64,
+               "filename": filename, "prompt_id": prompt_id}
+        if png_b64:
+            out["last_frame_png"] = png_b64
+            out["last_frame_png_filename"] = png_filename
+        return out
     except Exception as e:
         return {"status": "error", "error_type": type(e).__name__,
                 "error_message": str(e)[:2000], "prompt_id": prompt_id}
